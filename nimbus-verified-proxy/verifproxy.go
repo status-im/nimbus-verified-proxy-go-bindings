@@ -8,23 +8,41 @@ package verifproxy
 	#include <stdlib.h>
 	#include <string.h>
 
-	extern void goCallbackWrapper(Context *ctx, int status, char *result);
-	extern void goStartCallbackWrapper(Context *ctx, int status, char *result);
+	extern void goCallbackWrapper(Context *ctx, int status, char *result, void *userData);
+
+	extern void goTransportWrapper(Context *ctx, char *url, char *name, char *params, CallBackProc cb, void *userData);
 
 	// Use weak linkage to allow duplicate symbols (linker will use one)
 	// This works around CGO splitting C code into multiple object files
-	__attribute__((weak)) void cGoCallback(Context *ctx, int status, char *result) {
-		goCallbackWrapper(ctx, status, result);
+	__attribute__((weak)) void cGoCallback(Context *ctx, int status, char *result, void *userData) {
+		goCallbackWrapper(ctx, status, result, userData);
 	}
 
-	__attribute__((weak)) void cGoStartCallback(Context *ctx, int status, char *result) {
-		goStartCallbackWrapper(ctx, status, result);
+	// Use weak linkage to allow duplicate symbols (linker will use one)
+	// This works around CGO splitting C code into multiple object files
+	__attribute__((weak)) void cGoTransport(Context *ctx, char *url, char *name, char *params, CallBackProc cb, void *userData) {
+		goTransportWrapper(ctx, url, name, params, cb, userData);
+	}
+
+	static inline void callCCallback(Context *ctx, int status, char *result, void *userData, CallBackProc cb) {
+		cb(ctx, status, result, userData);
+	}
+
+	static inline Context *callStartVerifProxy(char *configJson, TransportProc transport, CallBackProc onStart, uintptr_t userData) {
+		return startVerifProxy(configJson, transport, onStart, (void *)userData);
+	}
+
+	static inline void callNvp(Context *ctx, char *method, char *params, CallBackProc cb, uintptr_t userData) {
+		nvp_call(ctx, method, params, cb, (void *)userData);
 	}
 
 */
 import "C"
 import (
 	"errors"
+	"fmt"
+	"runtime"
+	"runtime/cgo"
 	"sync"
 	"time"
 	"unsafe"
@@ -32,548 +50,341 @@ import (
 	"go.uber.org/zap"
 )
 
+const requestTimeout = 5 * time.Second
+
+type VerifyProxyResult struct {
+	status   int
+	response string
+}
+
+type VerifyProxyCallArgs struct {
+	method     string
+	params     string
+	resultChan chan VerifyProxyResult
+}
+
+// Context represents an opaque execution context managed on the Nim side
+type Context struct {
+	ctxPtr          *C.Context
+	logger          *zap.Logger
+	stopChan        chan VerifyProxyResult
+	executeTaskChan chan VerifyProxyCallArgs
+}
+
 var (
 	errEmptyContext = errors.New("empty context")
 	errTimeout      = errors.New("request timeout")
-	nimMainCalled   bool
-	nimMainMu       sync.Mutex
+	startOnce       sync.Once
 )
 
-// initNimMain ensures NimMain is called once before any C API calls
-func initNimMain() {
-	nimMainMu.Lock()
-	defer nimMainMu.Unlock()
-	if !nimMainCalled {
-		C.NimMain()
-		nimMainCalled = true
-	}
-}
-
-//export goStartCallbackWrapper
-func goStartCallbackWrapper(ctx *C.Context, status C.int, result *C.char) {
-	ctxPtr := unsafe.Pointer(ctx)
-	goCtx := getContextFromPtr(ctxPtr)
-	if goCtx == nil {
-		return
-	}
-
-	resultStr := ""
-	if result != nil {
-		resultStr = C.GoString(result)
-		// Free the result string as per the C API documentation
-		C.freeResponse(result)
-	}
-
-	// Invoke the onStart callback if it was provided
-	goCtx.mu.Lock()
-	onStart := goCtx.onStartCallback
-	goCtx.mu.Unlock()
-
-	if onStart != nil {
-		onStart(goCtx, Status(status), resultStr)
-	}
-}
-
 //export goCallbackWrapper
-func goCallbackWrapper(ctx *C.Context, status C.int, result *C.char) {
-	ctxPtr := unsafe.Pointer(ctx)
-	goCtx := getContextFromPtr(ctxPtr)
-	if goCtx == nil {
-		return
-	}
+func goCallbackWrapper(ctx *C.Context, status C.int, result *C.char, userData unsafe.Pointer) {
+	h := cgo.Handle(userData)
+	defer h.Delete()
 
-	resultStr := ""
-	if result != nil {
-		resultStr = C.GoString(result)
-		// Free the result string as per the C API documentation
-		C.freeResponse(result)
-	}
+	ch := h.Value().(chan VerifyProxyResult)
+	resultStr := C.GoString(result)
+	C.freeNimAllocatedString(result)
+	statusInt := int(status)
 
-	// Find pending callback for this context
-	// Note: We only support one pending callback at a time per context
-	goCtx.mu.Lock()
-	pending, ok := goCtx.pendingCallbacks[ctxPtr]
-	if ok {
-		delete(goCtx.pendingCallbacks, ctxPtr)
-	}
-	goCtx.mu.Unlock()
-
-	if ok && pending != nil {
-		pending(goCtx, Status(status), resultStr)
-	}
+	ch <- VerifyProxyResult{status: statusInt, response: resultStr}
 }
 
-// StartVerifProxy starts the verification proxy with a given configuration.
-// configJson: JSON string describing the configuration for the verification proxy.
-// onStart: Callback invoked once the proxy has started. NOTE: The callback is invoked
-// only on error otherwise the proxy runs indefinitely
-//
-// Returns a new Context object representing the running proxy.
-func StartVerifProxy(logger *zap.Logger, configJson string, onStart CallbackProc) (*Context, error) {
-	if logger == nil {
-		logger = zap.NewNop()
+//export goTransportWrapper
+func goTransportWrapper(ctx *C.Context, url *C.char, method *C.char, params *C.char, cb C.CallBackProc, userData unsafe.Pointer) {
+	resp, err := SendRPC(C.GoString(url), C.GoString(method), C.GoString(params))
+	defer C.freeNimAllocatedString(url)
+	defer C.freeNimAllocatedString(params)
+
+	if err == nil {
+		cResult := C.CString(string(resp))
+		defer C.free(unsafe.Pointer(cResult))
+
+		C.callCCallback(ctx, C.RET_SUCCESS, cResult, userData, cb)
+	} else {
+		cError := C.CString(err.Error())
+		defer C.free(unsafe.Pointer(cError))
+
+		C.callCCallback(ctx, C.RET_ERROR, cError, userData, cb)
 	}
 
-	ctx := &Context{
-		logger:           logger,
-		stopChan:         make(chan struct{}),
-		pendingCallbacks: make(map[unsafe.Pointer]CallbackProc),
-		onStartCallback:  onStart,
-	}
-
-	// Initialize Nim runtime
-	initNimMain()
-
-	cConfigJson := C.CString(configJson)
-	defer C.free(unsafe.Pointer(cConfigJson))
-
-	// Call startVerifProxy with the start callback wrapper
-	// The onStart callback will be invoked by the C library if there's an error
-	ctxPtr := C.startVerifProxy(cConfigJson, (*[0]byte)(C.cGoStartCallback))
-	if ctxPtr == nil {
-		return nil, errors.New("failed to start verification proxy")
-	}
-
-	ctx.ctx = unsafe.Pointer(ctxPtr)
-	registerContext(ctx)
-
-	ctx.logger.Info("successfully started verification proxy")
-	return ctx, nil
 }
 
 // Stop stops a running verification proxy.
 // After calling this, the context is no longer valid and must not be used.
 func (ctx *Context) Stop() error {
-	if ctx == nil || ctx.ctx == nil {
+	if ctx == nil {
 		return errEmptyContext
 	}
 
-	C.stopVerifProxy((*C.Context)(ctx.ctx))
-	close(ctx.stopChan)
-	unregisterContext(ctx)
-	ctx.ctx = nil
+	ctx.stopChan <- VerifyProxyResult{status: RET_CANCELLED, response: "cancelled by user"}
+	ctx.logger.Info("stopped verification proxy")
 	return nil
 }
 
-// Free frees the Context object. This should be called when the context is no longer needed.
-func (ctx *Context) Free() {
-	if ctx == nil || ctx.ctx == nil {
-		return
+// Start starts the verification proxy with a given configuration.
+// configJson: JSON string describing the configuration for the verification proxy.
+// onStart: Callback invoked once the proxy has started. NOTE: The callback is invoked
+// only on error otherwise the proxy runs indefinitely
+//
+// Returns a new Context object representing the running proxy.
+func Start(logger *zap.Logger, configJson string) (*Context, error) {
+	if logger == nil {
+		logger = zap.NewNop()
 	}
 
-	C.freeContext((*C.Context)(ctx.ctx))
-	unregisterContext(ctx)
-	ctx.ctx = nil
-}
-
-// ProcessTasks processes pending tasks for a running verification proxy.
-// This function should be called periodically to allow the proxy to handle
-// queued tasks, callbacks, and events. It is non-blocking.
-func (ctx *Context) ProcessTasks() {
-	if ctx == nil || ctx.ctx == nil {
-		return
+	goCtx := &Context{
+		logger:          logger,
+		stopChan:        make(chan VerifyProxyResult, 1),    // buffered because there are two senders, Stop and callback for startVerifProxy
+		executeTaskChan: make(chan VerifyProxyCallArgs, 64), //Task queue
 	}
 
-	C.processVerifProxyTasks((*C.Context)(ctx.ctx))
+	// Initialize Nim runtime
+	startOnce.Do(func() {
+		C.NimMain()
+	})
+
+	cConfigJson := C.CString(configJson)
+	defer C.free(unsafe.Pointer(cConfigJson))
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// start the event loop
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		// Call startVerifProxy with the start callback wrapper
+		// The onStart callback will be invoked by the C library if there's an error
+
+		h := cgo.NewHandle(goCtx.stopChan)
+		defer h.Delete()
+
+		ctxPtr := C.callStartVerifProxy(cConfigJson, (*[0]byte)(C.cGoTransport), (*[0]byte)(C.cGoCallback), C.uintptr_t(h))
+		if ctxPtr == nil {
+			goCtx.logger.Error("failed to start verification proxy")
+		}
+		goCtx.logger.Info("successfully started verification proxy")
+		wg.Done()
+
+	loop:
+		for {
+			select {
+
+			case callArgs := <-goCtx.executeTaskChan:
+				h := cgo.NewHandle(callArgs.resultChan)
+
+				cMethod := C.CString(callArgs.method)
+				cParams := C.CString(callArgs.params)
+
+				C.callNvp(ctxPtr, cMethod, cParams, (*[0]byte)(C.cGoCallback), C.uintptr_t(h))
+				C.free(unsafe.Pointer(cMethod))
+				C.free(unsafe.Pointer(cParams))
+			case startErrRes := <-goCtx.stopChan:
+				goCtx.logger.Error(startErrRes.response)
+				C.stopVerifProxy(ctxPtr)
+				C.freeContext(ctxPtr)
+				break loop
+			default:
+				C.processVerifProxyTasks(ctxPtr)
+			}
+		}
+
+		goCtx.logger.Info("Stopping Verified Proxy Event Loop")
+
+	}()
+
+	wg.Wait()
+	return goCtx, nil
 }
 
 // callAsync makes an asynchronous call to the C library and waits for the callback
-func (ctx *Context) callAsync(callFunc func(), timeout time.Duration) (Status, string, error) {
-	if ctx == nil || ctx.ctx == nil {
-		return RET_ERROR, "", errEmptyContext
+func (ctx *Context) CallRpc(method string, params string, timeout time.Duration) (string, error) {
+	if ctx == nil {
+		return "", errEmptyContext
 	}
 
-	var wg sync.WaitGroup
-	var resultStatus Status
-	var resultStr string
-	var resultErr error
-
-	callback := func(ctx *Context, status Status, result string) {
-		resultStatus = status
-		resultStr = result
-		wg.Done()
+	if timeout <= 0 {
+		timeout = requestTimeout
 	}
 
-	ctx.mu.Lock()
-	ctx.pendingCallbacks[ctx.ctx] = callback
-	ctx.mu.Unlock()
+	resultChan := make(chan VerifyProxyResult, 0)
+	ctx.executeTaskChan <- VerifyProxyCallArgs{method: method, params: params, resultChan: resultChan}
 
-	wg.Add(1)
-	callFunc()
+	select {
 
-	// Wait for callback with timeout
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	for {
-		select {
-		case <-done:
-			// Callback received
-			ctx.mu.Lock()
-			delete(ctx.pendingCallbacks, ctx.ctx)
-			ctx.mu.Unlock()
-			return resultStatus, resultStr, resultErr
-		case <-time.After(timeout):
-			ctx.mu.Lock()
-			delete(ctx.pendingCallbacks, ctx.ctx)
-			ctx.mu.Unlock()
-			return RET_ERROR, "", errTimeout
-		default:
-			ctx.ProcessTasks()
+	case proxyResult := <-resultChan:
+		if proxyResult.status == RET_SUCCESS {
+			return proxyResult.response, nil
+		} else {
+			return "", errors.New(proxyResult.response)
 		}
+	case <-time.After(timeout):
+		return "", errors.New("request timed out")
 	}
+
 }
 
 /* ========================================================================== */
 /*                               BASIC CHAIN DATA                              */
 /* ========================================================================== */
 
-// BlockNumber retrieves the current blockchain head block number.
-func (ctx *Context) BlockNumber() (Status, string, error) {
-	return ctx.callAsync(func() {
-		C.eth_blockNumber((*C.Context)(ctx.ctx), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) BlockNumber() (string, error) {
+	return ctx.CallRpc("eth_blockNumber", "[]", 0)
 }
 
-// BlobBaseFee retrieves the EIP-4844 blob base fee.
-func (ctx *Context) BlobBaseFee() (Status, string, error) {
-	return ctx.callAsync(func() {
-		C.eth_blobBaseFee((*C.Context)(ctx.ctx), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) BlobBaseFee() (string, error) {
+	return ctx.CallRpc("eth_blobBaseFee", "[]", 0)
 }
 
-// GasPrice retrieves the current gas price.
-func (ctx *Context) GasPrice() (Status, string, error) {
-	return ctx.callAsync(func() {
-		C.eth_gasPrice((*C.Context)(ctx.ctx), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GasPrice() (string, error) {
+	return ctx.CallRpc("eth_gasPrice", "[]", 0)
 }
 
-// MaxPriorityFeePerGas retrieves the suggested priority fee per gas.
-func (ctx *Context) MaxPriorityFeePerGas() (Status, string, error) {
-	return ctx.callAsync(func() {
-		C.eth_maxPriorityFeePerGas((*C.Context)(ctx.ctx), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) MaxPriorityFeePerGas() (string, error) {
+	return ctx.CallRpc("eth_maxPriorityFeePerGas", "[]", 0)
 }
 
 /* ========================================================================== */
 /*                          ACCOUNT & STORAGE ACCESS                           */
 /* ========================================================================== */
 
-// GetBalance retrieves an account balance.
-// address: 20-byte hex Ethereum address.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-func (ctx *Context) GetBalance(address, blockTag string) (Status, string, error) {
-	cAddress := C.CString(address)
-	defer C.free(unsafe.Pointer(cAddress))
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getBalance((*C.Context)(ctx.ctx), cAddress, cBlockTag, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetBalance(address, blockTag string) (string, error) {
+	params := fmt.Sprintf(`["%s","%s"]`, address, blockTag)
+	return ctx.CallRpc("eth_getBalance", params, 0)
 }
 
-// GetStorageAt retrieves storage from a contract.
-// address: 20-byte hex Ethereum address.
-// slot: 32-byte hex-encoded storage slot index.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-func (ctx *Context) GetStorageAt(address, slot, blockTag string) (Status, string, error) {
-	cAddress := C.CString(address)
-	defer C.free(unsafe.Pointer(cAddress))
-	cSlot := C.CString(slot)
-	defer C.free(unsafe.Pointer(cSlot))
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getStorageAt((*C.Context)(ctx.ctx), cAddress, cSlot, cBlockTag, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetStorageAt(address, slot, blockTag string) (string, error) {
+	params := fmt.Sprintf(`["%s","%s","%s"]`, address, slot, blockTag)
+	return ctx.CallRpc("eth_getStorageAt", params, 0)
 }
 
-// GetTransactionCount retrieves an address's transaction count (nonce).
-// address: 20-byte hex Ethereum address.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-func (ctx *Context) GetTransactionCount(address, blockTag string) (Status, string, error) {
-	cAddress := C.CString(address)
-	defer C.free(unsafe.Pointer(cAddress))
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getTransactionCount((*C.Context)(ctx.ctx), cAddress, cBlockTag, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetTransactionCount(address, blockTag string) (string, error) {
+	params := fmt.Sprintf(`["%s","%s"]`, address, blockTag)
+	return ctx.CallRpc("eth_getTransactionCount", params, 0)
 }
 
-// GetCode retrieves bytecode stored at an address.
-// address: 20-byte hex Ethereum address.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-func (ctx *Context) GetCode(address, blockTag string) (Status, string, error) {
-	cAddress := C.CString(address)
-	defer C.free(unsafe.Pointer(cAddress))
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getCode((*C.Context)(ctx.ctx), cAddress, cBlockTag, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetCode(address, blockTag string) (string, error) {
+	params := fmt.Sprintf(`["%s","%s"]`, address, blockTag)
+	return ctx.CallRpc("eth_getCode", params, 0)
 }
 
 /* ========================================================================== */
 /*                            BLOCK & UNCLE QUERIES                            */
 /* ========================================================================== */
 
-// GetBlockByHash retrieves a block by hash.
-// blockHash: 32-byte hex encoded block hash.
-// fullTransactions: Whether full tx objects should be included.
-func (ctx *Context) GetBlockByHash(blockHash string, fullTransactions bool) (Status, string, error) {
-	cBlockHash := C.CString(blockHash)
-	defer C.free(unsafe.Pointer(cBlockHash))
-
-	return ctx.callAsync(func() {
-		C.eth_getBlockByHash((*C.Context)(ctx.ctx), cBlockHash, C.bool(fullTransactions), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetBlockByHash(blockHash string, fullTx bool) (string, error) {
+	params := fmt.Sprintf(`["%s",%t]`, blockHash, fullTx)
+	return ctx.CallRpc("eth_getBlockByHash", params, 0)
 }
 
-// GetBlockByNumber retrieves a block by number or tag.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-// fullTransactions: Whether full tx objects should be included.
-func (ctx *Context) GetBlockByNumber(blockTag string, fullTransactions bool) (Status, string, error) {
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getBlockByNumber((*C.Context)(ctx.ctx), cBlockTag, C.bool(fullTransactions), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetBlockByNumber(blockTag string, fullTx bool) (string, error) {
+	params := fmt.Sprintf(`["%s",%t]`, blockTag, fullTx)
+	return ctx.CallRpc("eth_getBlockByNumber", params, 0)
 }
 
-// GetUncleCountByBlockNumber gets the number of uncles in a block.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-func (ctx *Context) GetUncleCountByBlockNumber(blockTag string) (Status, string, error) {
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getUncleCountByBlockNumber((*C.Context)(ctx.ctx), cBlockTag, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetUncleCountByBlockNumber(blockTag string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, blockTag)
+	return ctx.CallRpc("eth_getUncleCountByBlockNumber", params, 0)
 }
 
-// GetUncleCountByBlockHash gets the number of uncles in a block.
-// blockHash: 32-byte hex encoded block hash.
-func (ctx *Context) GetUncleCountByBlockHash(blockHash string) (Status, string, error) {
-	cBlockHash := C.CString(blockHash)
-	defer C.free(unsafe.Pointer(cBlockHash))
-
-	return ctx.callAsync(func() {
-		C.eth_getUncleCountByBlockHash((*C.Context)(ctx.ctx), cBlockHash, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetUncleCountByBlockHash(blockHash string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, blockHash)
+	return ctx.CallRpc("eth_getUncleCountByBlockHash", params, 0)
 }
 
-// GetBlockTransactionCountByNumber gets the number of transactions in a block.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-func (ctx *Context) GetBlockTransactionCountByNumber(blockTag string) (Status, string, error) {
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getBlockTransactionCountByNumber((*C.Context)(ctx.ctx), cBlockTag, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetBlockTransactionCountByNumber(blockTag string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, blockTag)
+	return ctx.CallRpc("eth_getBlockTransactionCountByNumber", params, 0)
 }
 
-// GetBlockTransactionCountByHash gets the number of transactions in a block identified by hash.
-// blockHash: 32-byte hex encoded block hash.
-func (ctx *Context) GetBlockTransactionCountByHash(blockHash string) (Status, string, error) {
-	cBlockHash := C.CString(blockHash)
-	defer C.free(unsafe.Pointer(cBlockHash))
-
-	return ctx.callAsync(func() {
-		C.eth_getBlockTransactionCountByHash((*C.Context)(ctx.ctx), cBlockHash, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetBlockTransactionCountByHash(blockHash string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, blockHash)
+	return ctx.CallRpc("eth_getBlockTransactionCountByHash", params, 0)
 }
 
 /* ========================================================================== */
 /*                           TRANSACTION QUERIES                               */
 /* ========================================================================== */
 
-// GetTransactionByBlockNumberAndIndex retrieves a transaction in a block by index.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-// index: Zero-based transaction index.
-func (ctx *Context) GetTransactionByBlockNumberAndIndex(blockTag string, index uint64) (Status, string, error) {
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getTransactionByBlockNumberAndIndex((*C.Context)(ctx.ctx), cBlockTag, C.ulonglong(index), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetTransactionByBlockNumberAndIndex(blockTag string, index uint64) (string, error) {
+	params := fmt.Sprintf(`["%s","0x%x"]`, blockTag, index)
+	return ctx.CallRpc("eth_getTransactionByBlockNumberAndIndex", params, 0)
 }
 
-// GetTransactionByBlockHashAndIndex retrieves a transaction by block hash and index.
-// blockHash: 32-byte hex encoded block hash.
-// index: Zero-based transaction index.
-func (ctx *Context) GetTransactionByBlockHashAndIndex(blockHash string, index uint64) (Status, string, error) {
-	cBlockHash := C.CString(blockHash)
-	defer C.free(unsafe.Pointer(cBlockHash))
-
-	return ctx.callAsync(func() {
-		C.eth_getTransactionByBlockHashAndIndex((*C.Context)(ctx.ctx), cBlockHash, C.ulonglong(index), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetTransactionByBlockHashAndIndex(blockHash string, index uint64) (string, error) {
+	params := fmt.Sprintf(`["%s","0x%x"]`, blockHash, index)
+	return ctx.CallRpc("eth_getTransactionByBlockHashAndIndex", params, 0)
 }
 
-// GetTransactionByHash retrieves a transaction by hash.
-// txHash: 32-byte hex encoded transaction hash.
-func (ctx *Context) GetTransactionByHash(txHash string) (Status, string, error) {
-	cTxHash := C.CString(txHash)
-	defer C.free(unsafe.Pointer(cTxHash))
-
-	return ctx.callAsync(func() {
-		C.eth_getTransactionByHash((*C.Context)(ctx.ctx), cTxHash, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetTransactionByHash(txHash string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, txHash)
+	return ctx.CallRpc("eth_getTransactionByHash", params, 0)
 }
 
-// GetTransactionReceipt retrieves a transaction receipt by hash.
-// txHash: 32-byte hex encoded transaction hash.
-func (ctx *Context) GetTransactionReceipt(txHash string) (Status, string, error) {
-	cTxHash := C.CString(txHash)
-	defer C.free(unsafe.Pointer(cTxHash))
-
-	return ctx.callAsync(func() {
-		C.eth_getTransactionReceipt((*C.Context)(ctx.ctx), cTxHash, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetTransactionReceipt(txHash string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, txHash)
+	return ctx.CallRpc("eth_getTransactionReceipt", params, 0)
 }
 
 /* ========================================================================== */
 /*                          CALL / GAS / ACCESS LISTS                          */
 /* ========================================================================== */
 
-// Call executes an eth_call.
-// txArgs: JSON encoded string containing call parameters.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-// optimisticStateFetch: Whether optimistic state fetching is allowed.
-func (ctx *Context) Call(txArgs, blockTag string, optimisticStateFetch bool) (Status, string, error) {
-	cTxArgs := C.CString(txArgs)
-	defer C.free(unsafe.Pointer(cTxArgs))
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_call((*C.Context)(ctx.ctx), cTxArgs, cBlockTag, C.bool(optimisticStateFetch), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) Call(txArgs, blockTag string, optimistic bool) (string, error) {
+	params := fmt.Sprintf(`[%s,"%s",%t]`, txArgs, blockTag, optimistic)
+	return ctx.CallRpc("eth_call", params, 0)
 }
 
-// CreateAccessList generates an EIP-2930 access list.
-// txArgs: JSON encoded string containing call parameters.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-// optimisticStateFetch: Whether optimistic state fetching is allowed.
-func (ctx *Context) CreateAccessList(txArgs, blockTag string, optimisticStateFetch bool) (Status, string, error) {
-	cTxArgs := C.CString(txArgs)
-	defer C.free(unsafe.Pointer(cTxArgs))
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_createAccessList((*C.Context)(ctx.ctx), cTxArgs, cBlockTag, C.bool(optimisticStateFetch), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) CreateAccessList(txArgs, blockTag string, optimistic bool) (string, error) {
+	params := fmt.Sprintf(`[%s,"%s",%t]`, txArgs, blockTag, optimistic)
+	return ctx.CallRpc("eth_createAccessList", params, 0)
 }
 
-// EstimateGas estimates gas for a transaction.
-// txArgs: JSON encoded string containing call parameters.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-// optimisticStateFetch: Whether optimistic state fetching is allowed.
-func (ctx *Context) EstimateGas(txArgs, blockTag string, optimisticStateFetch bool) (Status, string, error) {
-	cTxArgs := C.CString(txArgs)
-	defer C.free(unsafe.Pointer(cTxArgs))
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_estimateGas((*C.Context)(ctx.ctx), cTxArgs, cBlockTag, C.bool(optimisticStateFetch), (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) EstimateGas(txArgs, blockTag string, optimistic bool) (string, error) {
+	params := fmt.Sprintf(`[%s,"%s",%t]`, txArgs, blockTag, optimistic)
+	return ctx.CallRpc("eth_estimateGas", params, 0)
 }
 
 /* ========================================================================== */
 /*                               LOGS & FILTERS                                */
 /* ========================================================================== */
 
-// GetLogs retrieves logs matching a filter.
-// filterOptions: JSON encoded string specifying the log filtering rules.
-func (ctx *Context) GetLogs(filterOptions string) (Status, string, error) {
-	cFilterOptions := C.CString(filterOptions)
-	defer C.free(unsafe.Pointer(cFilterOptions))
-
-	return ctx.callAsync(func() {
-		C.eth_getLogs((*C.Context)(ctx.ctx), cFilterOptions, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetLogs(filterOptions string) (string, error) {
+	params := fmt.Sprintf(`[%s]`, filterOptions)
+	return ctx.CallRpc("eth_getLogs", params, 0)
 }
 
-// NewFilter creates a new log filter.
-// filterOptions: JSON encoded string specifying the log filtering rules.
-func (ctx *Context) NewFilter(filterOptions string) (Status, string, error) {
-	cFilterOptions := C.CString(filterOptions)
-	defer C.free(unsafe.Pointer(cFilterOptions))
-
-	return ctx.callAsync(func() {
-		C.eth_newFilter((*C.Context)(ctx.ctx), cFilterOptions, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) NewFilter(filterOptions string) (string, error) {
+	params := fmt.Sprintf(`[%s]`, filterOptions)
+	return ctx.CallRpc("eth_newFilter", params, 0)
 }
 
-// UninstallFilter removes an installed filter.
-// filterId: filter ID as a hex encoded string (as returned by NewFilter).
-func (ctx *Context) UninstallFilter(filterId string) (Status, string, error) {
-	cFilterId := C.CString(filterId)
-	defer C.free(unsafe.Pointer(cFilterId))
-
-	return ctx.callAsync(func() {
-		C.eth_uninstallFilter((*C.Context)(ctx.ctx), cFilterId, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) UninstallFilter(filterId string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, filterId)
+	return ctx.CallRpc("eth_uninstallFilter", params, 0)
 }
 
-// GetFilterLogs retrieves all logs for an installed filter.
-// filterId: filter ID as a hex encoded string (as returned by NewFilter).
-func (ctx *Context) GetFilterLogs(filterId string) (Status, string, error) {
-	cFilterId := C.CString(filterId)
-	defer C.free(unsafe.Pointer(cFilterId))
-
-	return ctx.callAsync(func() {
-		C.eth_getFilterLogs((*C.Context)(ctx.ctx), cFilterId, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetFilterLogs(filterId string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, filterId)
+	return ctx.CallRpc("eth_getFilterLogs", params, 0)
 }
 
-// GetFilterChanges retrieves new logs since the previous poll.
-// filterId: filter ID as a hex encoded string (as returned by NewFilter).
-func (ctx *Context) GetFilterChanges(filterId string) (Status, string, error) {
-	cFilterId := C.CString(filterId)
-	defer C.free(unsafe.Pointer(cFilterId))
-
-	return ctx.callAsync(func() {
-		C.eth_getFilterChanges((*C.Context)(ctx.ctx), cFilterId, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetFilterChanges(filterId string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, filterId)
+	return ctx.CallRpc("eth_getFilterChanges", params, 0)
 }
 
 /* ========================================================================== */
 /*                              RECEIPT QUERIES                                */
 /* ========================================================================== */
 
-// GetBlockReceipts retrieves all receipts for a block.
-// blockTag: A block identifier: "latest", "pending", "earliest", or a hex block number such as "0x10d4f".
-func (ctx *Context) GetBlockReceipts(blockTag string) (Status, string, error) {
-	cBlockTag := C.CString(blockTag)
-	defer C.free(unsafe.Pointer(cBlockTag))
-
-	return ctx.callAsync(func() {
-		C.eth_getBlockReceipts((*C.Context)(ctx.ctx), cBlockTag, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) GetBlockReceipts(blockTag string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, blockTag)
+	return ctx.CallRpc("eth_getBlockReceipts", params, 0)
 }
 
-// SendRawTransaction sends a signed transaction to the RPC provider to be relayed in the network.
-// txHexBytes: Hex encoded signed transaction.
-func (ctx *Context) SendRawTransaction(txHexBytes string) (Status, string, error) {
-	cTxHexBytes := C.CString(txHexBytes)
-	defer C.free(unsafe.Pointer(cTxHexBytes))
-
-	return ctx.callAsync(func() {
-		C.eth_sendRawTransaction((*C.Context)(ctx.ctx), cTxHexBytes, (*[0]byte)(C.cGoCallback))
-	}, requestTimeout)
+func (ctx *Context) SendRawTransaction(txHex string) (string, error) {
+	params := fmt.Sprintf(`["%s"]`, txHex)
+	return ctx.CallRpc("eth_sendRawTransaction", params, 0)
 }
